@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>えんかく筆談ボード</title>
+    <!-- PeerJSのライブラリを読み込み -->
+    <script src="https://unpkg.com"></script>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        /* iPadのスクロールや引っ張りを完全に禁止 */
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            position: fixed;
+            background-color: #f0f0f0;
+            font-family: sans-serif;
+            touch-action: none;
+        }
+        /* ホワイトボード（キャンバス） */
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #ffffff;
+            cursor: crosshair;
+        }
+        /* お父様でも押しやすい「ぜんぶけす」ボタン */
+        #clear-btn {
+            position: absolute;
+            bottom: 30px;
+            right: 30px;
+            width: 160px;
+            height: 80px;
+            background-color: #ff4d4d;
+            color: white;
+            border: none;
+            border-radius: 15px;
+            font-size: 24px;
+            font-weight: bold;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.2);
+            z-index: 10;
+        }
+        #clear-btn:active {
+            background-color: #cc0000;
+            transform: translateY(2px);
+        }
+        /* 接続状態を表示するランプ（あなた用の確認用） */
+        #status-lamp {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            background-color: #ccc;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="status-lamp"></div>
+    <canvas id="board"></canvas>
+    <button id="clear-btn">ぜんぶけす</button>
+
+<script>
+    // --- ⚙️ 設定 ---
+    // 他の利用者と被らないように、ここをご家族専用の英数字（例: tanaka-family-999-）に変更してください
+    const ROOM_PREFIX = 'kazoku-hitudan-sumida-'; 
+    
+    // --- 1. URLから役割（自分かお父様か）を自動判別 ---
+    const urlParams = new URLSearchParams(window.location.search);
+    const role = urlParams.get('role'); // ?role=me または ?role=parent
+
+    // 自分のIDと、接続相手のIDを決定
+    const myId = (role === 'parent') ? ROOM_PREFIX + 'parent' : ROOM_PREFIX + 'me';
+    const targetId = (role === 'parent') ? ROOM_PREFIX + 'me' : ROOM_PREFIX + 'parent';
+
+    // 役割に応じて線の色を変える（お父様は黒、あなたは青）
+    const myColor = (role === 'parent') ? '#000000' : '#0000ff';
+
+    // --- 2. キャンバスと描画初期化 ---
+    const canvas = document.getElementById('board');
+    const ctx = canvas.getContext('2d');
+    let isDrawing = false;
+    let conn = null; // 接続オブジェクト
+
+    // 画面サイズぴったりにキャンバスを合わせる
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        ctx.lineWidth = 6;       // 線の太さ（ご両親が見やすいよう太め）
+        ctx.lineCap = 'round';   // 線の角を丸く
+        ctx.lineJoin = 'round';
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- 3. PeerJS 接続処理（アカウント・キー不要の最新版仕様） ---
+    const peer = new Peer(myId);
+    const statusLamp = document.getElementById('status-lamp');
+
+    peer.on('open', () => {
+        statusLamp.style.backgroundColor = '#ffcc00'; // サーバー準備OK（黄）
+        // 自分自身が「me（あなた）」なら、お父様（parent）に自動で接続を試みる
+        if (role !== 'parent') {
+            connectToTarget();
+        }
+    });
+
+    // お父様側（parent）が、あなたからの接続を待ち受ける処理
+    peer.on('connection', (connection) => {
+        conn = connection;
+        setupConnection();
+    });
+
+    // あなた側からお父様へ接続する関数
+    function connectToTarget() {
+        conn = peer.connect(targetId, { reliable: true });
+        setupConnection();
+    }
+
+    // 接続が確立した後のイベント設定
+    function setupConnection() {
+        conn.on('open', () => {
+            statusLamp.style.backgroundColor = '#00cc66'; // 接続完了（緑）
+        });
+
+        // 相手からデータ（線の座標、または消去命令）が届いたとき
+        conn.on('data', (data) => {
+            if (data.type === 'draw') {
+                drawRemote(data);
+            } else if (data.type === 'clear') {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+            }
+        });
+
+        conn.on('close', () => {
+            statusLamp.style.backgroundColor = '#cc0000'; // 切断（赤）
+            // 切断されたら自動で再接続を試みる（10秒おき）
+            if (role !== 'parent') {
+                setTimeout(connectToTarget, 10000);
+            }
+        });
+    }
+
+    // --- 4. お絵描き（Pointer Events：ペン・指の両対応） ---
+    // Safariのデフォルト動作（ジェスチャー等）を完全にキャンセル
+    document.addEventListener('gesturestart', (e) => e.preventDefault());
+
+    canvas.addEventListener('pointerdown', (e) => {
+        isDrawing = true;
+        ctx.beginPath();
+        ctx.moveTo(e.clientX, e.clientY);
+        
+        // 開始点を送信
+        sendDrawData('start', e.clientX, e.clientY);
+    });
+
+    canvas.addEventListener('pointermove', (e) => {
+        if (!isDrawing) return;
+        ctx.strokeStyle = myColor;
+        ctx.lineTo(e.clientX, e.clientY);
+        ctx.stroke();
+
+        // 描画中の座標を送信
+        sendDrawData('move', e.clientX, e.clientY);
+    });
+
+    canvas.addEventListener('pointerup', () => {
+        isDrawing = false;
+        sendDrawData('end', 0, 0);
+    });
+
+    // データを相手に送信する関数（データ量が極小になるよう座標のみ送る）
+    function sendDrawData(action, x, y) {
+        if (conn && conn.open) {
+            conn.send({
+                type: 'draw',
+                action: action,
+                x: x / canvas.width,   // 画面サイズ差を吸収するため比率換算
+                y: y / canvas.height,
+                color: myColor
+            });
+        }
+    }
+
+    // 相手から届いた座標データを画面に描く関数
+    function drawRemote(data) {
+        const realX = data.x * canvas.width;
+        const realY = data.y * canvas.height;
+
+        ctx.strokeStyle = data.color;
+        if (data.action === 'start') {
+            ctx.beginPath();
+            ctx.moveTo(realX, realY);
+        } else if (data.action === 'move') {
+            ctx.lineTo(realX, realY);
+            ctx.stroke();
+        }
+    }
+
+    // --- 5. 「ぜんぶけす」ボタンの処理 ---
+    document.getElementById('clear-btn').addEventListener('click', () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // 相手の画面も消去するよう命令を送信
+        if (conn && conn.open) {
+            conn.send({ type: 'clear' });
+        }
+    });
+</script>
+</body>
+</html>
